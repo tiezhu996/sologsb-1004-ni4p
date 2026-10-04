@@ -28,6 +28,8 @@ const deviceOptions: Array<{ value: DeviceKind; label: string }> = [
 
 const draft = computed(() => store.selectedDraft)
 const exhibit = computed(() => store.selectedExhibit)
+const pendingImport = computed(() => store.pendingImport())
+const tourSyncRef = ref<{ resumePending: () => void } | null>(null)
 const currentLanguage = computed(() => LANGUAGES.find(item => item.id === store.selectedLanguageId))
 const currentStatus = computed(() => statusOptions.find(item => item.value === draft.value?.status) || statusOptions[0])
 const filteredExhibits = computed(() => store.hallExhibits.filter(item => !leftFilter.value || `${item.code} ${item.title}`.toLowerCase().includes(leftFilter.value.toLowerCase())))
@@ -188,8 +190,21 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
             <v-btn variant="outlined" prepend-icon="mdi-undo" :disabled="!store.canUndo" @click="store.undo">撤销</v-btn>
             <v-btn variant="outlined" prepend-icon="mdi-redo" :disabled="!store.canRedo" @click="store.redo">重做</v-btn>
             <v-btn variant="outlined" prepend-icon="mdi-history" @click="activeTab = 'versions'">版本</v-btn>
+            <TourSync ref="tourSyncRef" />
           </div>
         </div>
+
+        <v-alert
+          v-if="pendingImport"
+          class="mb-4"
+          type="warning"
+          variant="tonal"
+          closable
+          @click:close="store.discardPending()"
+        >
+          巡展包「{{ pendingImport.pkg.exportedBy }}」存在未决对账：{{ pendingImport.items.filter(item => (item.type === 'field' || item.type === 'removed-segment') && item.conflict).length }} 处冲突等待选定，选定前不会写入。
+          <v-btn size="small" variant="text" class="ms-2" @click="tourSyncRef?.resumePending()">继续裁决</v-btn>
+        </v-alert>
 
         <v-alert v-if="store.notice" class="mb-4" color="secondary" variant="tonal" closable @click:close="store.notice = ''">{{ store.notice }}</v-alert>
 

@@ -1,5 +1,9 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type { Exhibit, Hall, ImportReceipt, Language, LanguageDraft, MergeItem, PersistedState, ScriptStatus, Segment, SyncState, VersionSnapshot, TourPackage } from '~/types'
+import {
+  applyMerge, buildBaselines, buildReceipt, clone as cloneData, createTourPackage,
+  reconcile, uid, validatePackage
+} from './sync'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -8,6 +12,14 @@ export const LANGUAGES: Language[] = [
 ]
 
 const STORAGE_KEY = 'museum-script-studio-v1'
+
+export function languageLabel(id: string): string {
+  return LANGUAGES.find(item => item.id === id)?.label || id
+}
+
+function freshSync(halls: Hall[], exhibits: Exhibit[]): SyncState {
+  return { baselines: buildBaselines(halls, exhibits), tombstones: {}, receipts: [], pending: null }
+}
 
 const segments = (prefix: string, values: Array<[string, string, boolean?]>): Segment[] => values.map(([label, content, locked], index) => ({
   id: `${prefix}-${index + 1}`,
@@ -126,7 +138,8 @@ export const useScriptStore = defineStore('museum-script', {
     hydrated: false,
     past: [] as string[],
     future: [] as string[],
-    notice: ''
+    notice: '',
+    sync: null as SyncState | null
   }),
   getters: {
     selectedHall(state): Hall | undefined {
@@ -154,8 +167,20 @@ export const useScriptStore = defineStore('museum-script', {
       if (saved) {
         try {
           const data = JSON.parse(saved) as PersistedState
-          this.$patch({ ...data, hydrated: true })
-          if (!this.halls.length || !this.exhibits.length) this.resetDemo()
+          this.halls = data.halls || []
+          this.exhibits = data.exhibits || []
+          this.versions = data.versions || []
+          this.selectedHallId = data.selectedHallId || ''
+          this.selectedExhibitId = data.selectedExhibitId || ''
+          this.selectedLanguageId = data.selectedLanguageId || 'zh'
+          this.lastSavedAt = data.lastSavedAt || ''
+          this.sync = data.sync || null
+          this.hydrated = true
+          if (!this.halls.length || !this.exhibits.length) {
+            this.resetDemo()
+          } else {
+            this.upgradeLegacySync()
+          }
         } catch {
           this.resetDemo()
         }
@@ -165,13 +190,34 @@ export const useScriptStore = defineStore('museum-script', {
       this.ensureSelection()
       this.hydrated = true
     },
+    /** 旧本地数据升级：没有巡展基线时，以当前全库为基线补上，删除记录与回执为空 */
+    upgradeLegacySync() {
+      if (!this.sync) {
+        this.sync = freshSync(this.halls, this.exhibits)
+        this.persist()
+      }
+    },
     resetDemo() {
-      this.$patch({ ...demoState(), hydrated: true, past: [], future: [] })
+      const demo = demoState()
+      this.halls = demo.halls
+      this.exhibits = demo.exhibits
+      this.versions = demo.versions
+      this.selectedHallId = demo.selectedHallId
+      this.selectedExhibitId = demo.selectedExhibitId
+      this.selectedLanguageId = demo.selectedLanguageId
+      this.lastSavedAt = demo.lastSavedAt
+      this.sync = freshSync(demo.halls, demo.exhibits)
+      this.hydrated = true
+      this.past = []
+      this.future = []
       this.persist()
       this.notice = '示例数据已就绪，可直接开始编辑。'
     },
     snapshot(): string {
-      return JSON.stringify({ halls: this.halls, exhibits: this.exhibits, versions: this.versions })
+      return JSON.stringify({
+        halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        tombstones: this.sync?.tombstones || {}
+      })
     },
     commit(mutator: () => void) {
       this.past.push(this.snapshot())
@@ -186,7 +232,8 @@ export const useScriptStore = defineStore('museum-script', {
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
-        selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
+        selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt,
+        sync: this.sync || undefined
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
     },
@@ -233,13 +280,21 @@ export const useScriptStore = defineStore('museum-script', {
     addSegment() {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false }))
+      const order = draft.segments.length + 1
+      this.commit(() => draft.segments.push({ id: uid('segment'), label: `新段落 ${order}`, content: '', locked: false }))
     },
     removeSegment(id: string) {
       const draft = this.selectedDraft
       const segment = draft?.segments.find(item => item.id === id)
       if (!draft || !segment || segment.locked) return
-      this.commit(() => { draft.segments = draft.segments.filter(item => item.id !== id) })
+      this.commit(() => {
+        draft.segments = draft.segments.filter(item => item.id !== id)
+        // 记录稳定编号墓碑：旧巡展包不能把它复活（撤销时随快照回退）
+        const set = new Set(this.sync?.tombstones[draft.id] || [])
+        set.add(id)
+        if (this.sync) this.sync.tombstones[draft.id] = [...set]
+      })
+      this.notice = '段落已删除，旧交接包不会再将其带回。'
     },
     setStatus(status: ScriptStatus) {
       const draft = this.selectedDraft
@@ -272,6 +327,9 @@ export const useScriptStore = defineStore('museum-script', {
         if (!exhibit) return
         const index = exhibit.drafts.findIndex(item => item.languageId === version.languageId)
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
+        // 已删除段落（墓碑）不会因恢复旧快照而复活
+        const dead = new Set(this.sync?.tombstones[restored.id] || [])
+        if (dead.size) restored.segments = restored.segments.filter(segment => !dead.has(segment.id))
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
       })
@@ -283,7 +341,9 @@ export const useScriptStore = defineStore('museum-script', {
       const state = this.past.pop()
       if (!state) return
       this.future.push(this.snapshot())
-      this.$patch(JSON.parse(state))
+      const restored = JSON.parse(state)
+      this.$patch({ halls: restored.halls, exhibits: restored.exhibits, versions: restored.versions })
+      if (this.sync) this.sync.tombstones = restored.tombstones || {}
       this.lastSavedAt = new Date().toISOString()
       this.ensureSelection()
       this.persist()
@@ -293,7 +353,9 @@ export const useScriptStore = defineStore('museum-script', {
       const state = this.future.pop()
       if (!state) return
       this.past.push(this.snapshot())
-      this.$patch(JSON.parse(state))
+      const restored = JSON.parse(state)
+      this.$patch({ halls: restored.halls, exhibits: restored.exhibits, versions: restored.versions })
+      if (this.sync) this.sync.tombstones = restored.tombstones || {}
       this.lastSavedAt = new Date().toISOString()
       this.ensureSelection()
       this.persist()
@@ -304,6 +366,105 @@ export const useScriptStore = defineStore('museum-script', {
       if (!draft) return 0
       const checks = [draft.title, draft.narration, draft.accessibility, draft.sources, draft.segments.length > 0 ? 'segments' : '']
       return Math.round(checks.filter(Boolean).length / checks.length * 100)
+    },
+
+    /* ================= 巡展交接包 ================= */
+
+    requireSync(): SyncState {
+      if (!this.sync) this.sync = freshSync(this.halls, this.exhibits)
+      return this.sync
+    },
+    /** 导出巡展交接包：展厅、展项、每种语言稿携带共同基线与删除记录 */
+    exportTourPackage(exportedBy: string): TourPackage {
+      const sync = this.requireSync()
+      return createTourPackage({
+        halls: this.halls,
+        exhibits: this.exhibits,
+        baselines: sync.baselines,
+        tombstones: sync.tombstones,
+        exportedBy
+      })
+    },
+    /** 读取并校验交接包，按记录字段对账；重复导入同一包只返回既有回执 */
+    prepareImport(raw: unknown): { duplicated: boolean; receipt?: ImportReceipt; report?: { pkg: TourPackage; items: MergeItem[] } } {
+      const pkg = validatePackage(raw)
+      const sync = this.requireSync()
+      const existing = sync.receipts.find(receipt => receipt.packageId === pkg.packageId)
+      if (existing) {
+        this.notice = `该巡展包已于 ${new Date(existing.importedAt).toLocaleString('zh-CN')} 导入，回执不重复生成。`
+        return { duplicated: true, receipt: existing }
+      }
+      const report = reconcile({
+        pkg,
+        halls: this.halls,
+        exhibits: this.exhibits,
+        tombstones: sync.tombstones,
+        languageLabel,
+        hallName: (id: string) => this.halls.find(hall => hall.id === id)?.name || id
+      })
+      // 未决冲突现场先落盘：写入失败或刷新后仍可继续裁决
+      sync.pending = { pkg, items: report.items, report, createdAt: new Date().toISOString() }
+      this.persist()
+      return { duplicated: false, report: { pkg, items: report.items } }
+    },
+    /**
+     * 按裁决写入。整笔事务：任何一步失败都恢复到导入前状态，
+     * 未决冲突继续保留在 sync.pending。
+     */
+    commitImport(pkg: TourPackage, items: MergeItem[]): ImportReceipt {
+      const sync = this.requireSync()
+      const backup = JSON.stringify({
+        halls: this.halls,
+        exhibits: this.exhibits,
+        versions: this.versions,
+        sync,
+        past: this.past,
+        future: this.future
+      })
+      try {
+        const local = { halls: cloneData(this.halls), exhibits: cloneData(this.exhibits) }
+        const { tombstones, stats } = applyMerge(local, pkg, items, sync.tombstones)
+
+        // 成功：推进基线、留一张回执、清空未决现场
+        this.past.push(this.snapshot())
+        if (this.past.length > 50) this.past.shift()
+        this.future = []
+        this.halls = local.halls
+        this.exhibits = local.exhibits
+        sync.tombstones = tombstones
+        sync.baselines = buildBaselines(this.halls, this.exhibits)
+        const receipt = buildReceipt(pkg, items, stats)
+        sync.receipts = [...sync.receipts.filter(item => item.packageId !== pkg.packageId), receipt]
+        sync.pending = null
+        this.lastSavedAt = new Date().toISOString()
+        this.ensureSelection()
+        this.persist()
+        this.notice = receipt.summary
+        return receipt
+      } catch (error) {
+        // 失败：恢复导入前状态，未决冲突继续保留
+        const before = JSON.parse(backup)
+        this.halls = before.halls
+        this.exhibits = before.exhibits
+        this.versions = before.versions
+        this.past = before.past
+        this.future = before.future
+        this.sync = before.sync
+        this.ensureSelection()
+        this.persist()
+        this.notice = `导入未完成，已恢复导入前状态：${(error as Error).message} 未决冲突已保留。`
+        throw error
+      }
+    },
+    /** 放弃本次未决裁决（不写入），保留数据现状 */
+    discardPending() {
+      if (this.sync) {
+        this.sync.pending = null
+        this.persist()
+      }
+    },
+    pendingImport(): SyncState['pending'] {
+      return this.sync?.pending || null
     }
   }
 })

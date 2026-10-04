@@ -7,7 +7,10 @@
     "build": "nuxt build",
     "preview": "nuxt preview",
     "generate": "nuxt generate",
-    "typecheck": "nuxt typecheck"
+    "typecheck": "nuxt typecheck",
+    "test:sync": "node scripts/test-sync.mjs",
+    "test:store": "node scripts/test-store-sync.mjs",
+    "test": "node scripts/test-sync.mjs && node scripts/test-store-sync.mjs"
   },
   "dependencies": {
     "@pinia/nuxt": "0.11.3",
