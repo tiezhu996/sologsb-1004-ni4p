@@ -1,5 +1,29 @@
 import { defineStore } from 'pinia'
-import type { Exhibit, Hall, Language, LanguageDraft, PersistedState, ScriptStatus, Segment, VersionSnapshot } from '~/types'
+import type {
+  Exhibit,
+  Hall,
+  Language,
+  LanguageDraft,
+  PendingSyncImport,
+  PersistedState,
+  ScriptStatus,
+  Segment,
+  SyncConflictChoice,
+  SyncDataset,
+  SyncPackage,
+  SyncReceipt,
+  VersionSnapshot
+} from '~/types'
+import {
+  clone,
+  createDataset,
+  createStableId,
+  createSyncPackage,
+  parseSyncPackage,
+  pendingConflictCount,
+  receiptFromResult,
+  reconcileImport
+} from '~/utils/sync'
 
 export const LANGUAGES: Language[] = [
   { id: 'zh', code: 'zh-CN', label: '简体中文', shortLabel: '中' },
@@ -103,7 +127,7 @@ function demoState(): PersistedState {
       }]
     }
   ]
-  return {
+  const data = {
     halls,
     exhibits,
     versions: [],
@@ -112,6 +136,42 @@ function demoState(): PersistedState {
     selectedLanguageId: 'zh',
     lastSavedAt: new Date().toISOString()
   }
+  return {
+    ...data,
+    syncBaseline: createDataset(halls, exhibits),
+    tombstones: [],
+    pendingSyncImport: null,
+    syncReceipts: []
+  }
+}
+
+function migratePersistedState(raw: Partial<PersistedState>): PersistedState {
+  const halls = clone(Array.isArray(raw.halls) ? raw.halls : [])
+  const exhibits = clone(Array.isArray(raw.exhibits) ? raw.exhibits : [])
+  const usedSegmentIds = new Set<string>()
+
+  exhibits.forEach(exhibit => {
+    exhibit.drafts.forEach(draft => {
+      draft.segments.forEach(segment => {
+        if (!segment.id || usedSegmentIds.has(segment.id)) segment.id = createStableId(usedSegmentIds)
+        else usedSegmentIds.add(segment.id)
+      })
+    })
+  })
+
+  return {
+    halls,
+    exhibits,
+    versions: Array.isArray(raw.versions) ? raw.versions : [],
+    syncBaseline: raw.syncBaseline ? clone(raw.syncBaseline) : createDataset(halls, exhibits),
+    tombstones: Array.isArray(raw.tombstones) ? [...new Set(raw.tombstones.filter(Boolean))] : [],
+    pendingSyncImport: raw.pendingSyncImport || null,
+    syncReceipts: Array.isArray(raw.syncReceipts) ? raw.syncReceipts : [],
+    selectedHallId: raw.selectedHallId || '',
+    selectedExhibitId: raw.selectedExhibitId || '',
+    selectedLanguageId: raw.selectedLanguageId || 'zh',
+    lastSavedAt: raw.lastSavedAt || new Date().toISOString()
+  }
 }
 
 export const useScriptStore = defineStore('museum-script', {
@@ -119,6 +179,10 @@ export const useScriptStore = defineStore('museum-script', {
     halls: [] as Hall[],
     exhibits: [] as Exhibit[],
     versions: [] as VersionSnapshot[],
+    syncBaseline: createDataset([], []) as SyncDataset,
+    tombstones: [] as string[],
+    pendingSyncImport: null as PendingSyncImport | null,
+    syncReceipts: [] as SyncReceipt[],
     selectedHallId: '',
     selectedExhibitId: '',
     selectedLanguageId: 'zh',
@@ -145,7 +209,8 @@ export const useScriptStore = defineStore('museum-script', {
       return (this.selectedDraft?.narration || '').replace(/\s/g, '').length
     },
     canUndo(state): boolean { return state.past.length > 0 },
-    canRedo(state): boolean { return state.future.length > 0 }
+    canRedo(state): boolean { return state.future.length > 0 },
+    unresolvedSyncConflicts(state): number { return pendingConflictCount(state.pendingSyncImport) }
   },
   actions: {
     hydrate() {
@@ -153,8 +218,9 @@ export const useScriptStore = defineStore('museum-script', {
       const saved = localStorage.getItem(STORAGE_KEY)
       if (saved) {
         try {
-          const data = JSON.parse(saved) as PersistedState
-          this.$patch({ ...data, hydrated: true })
+          const raw = JSON.parse(saved) as Partial<PersistedState>
+          const migrated = migratePersistedState(raw)
+          this.$patch({ ...migrated, hydrated: true } as never)
           if (!this.halls.length || !this.exhibits.length) this.resetDemo()
         } catch {
           this.resetDemo()
@@ -166,12 +232,20 @@ export const useScriptStore = defineStore('museum-script', {
       this.hydrated = true
     },
     resetDemo() {
-      this.$patch({ ...demoState(), hydrated: true, past: [], future: [] })
+      this.$patch({ ...demoState(), hydrated: true, past: [], future: [] } as never)
       this.persist()
       this.notice = '示例数据已就绪，可直接开始编辑。'
     },
     snapshot(): string {
-      return JSON.stringify({ halls: this.halls, exhibits: this.exhibits, versions: this.versions })
+      return JSON.stringify({
+        halls: this.halls,
+        exhibits: this.exhibits,
+        versions: this.versions,
+        syncBaseline: this.syncBaseline,
+        tombstones: this.tombstones,
+        pendingSyncImport: this.pendingSyncImport,
+        syncReceipts: this.syncReceipts
+      })
     },
     commit(mutator: () => void) {
       this.past.push(this.snapshot())
@@ -185,6 +259,8 @@ export const useScriptStore = defineStore('museum-script', {
       if (typeof localStorage === 'undefined') return
       const data: PersistedState = {
         halls: this.halls, exhibits: this.exhibits, versions: this.versions,
+        syncBaseline: this.syncBaseline, tombstones: this.tombstones,
+        pendingSyncImport: this.pendingSyncImport, syncReceipts: this.syncReceipts,
         selectedHallId: this.selectedHallId, selectedExhibitId: this.selectedExhibitId,
         selectedLanguageId: this.selectedLanguageId, lastSavedAt: this.lastSavedAt
       }
@@ -233,13 +309,22 @@ export const useScriptStore = defineStore('museum-script', {
     addSegment() {
       const draft = this.selectedDraft
       if (!draft) return
-      this.commit(() => draft.segments.push({ id: `segment-${Date.now()}`, label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false }))
+      this.commit(() => {
+        const used = new Set<string>([
+          ...this.exhibits.flatMap(exhibit => exhibit.drafts.flatMap(item => item.segments.map(segment => segment.id))),
+          ...this.tombstones
+        ])
+        draft.segments.push({ id: createStableId(used), label: `新段落 ${draft.segments.length + 1}`, content: '', locked: false })
+      })
     },
     removeSegment(id: string) {
       const draft = this.selectedDraft
       const segment = draft?.segments.find(item => item.id === id)
       if (!draft || !segment || segment.locked) return
-      this.commit(() => { draft.segments = draft.segments.filter(item => item.id !== id) })
+      this.commit(() => {
+        draft.segments = draft.segments.filter(item => item.id !== id)
+        this.tombstones = Array.from(new Set([...this.tombstones, id])).sort()
+      })
     },
     setStatus(status: ScriptStatus) {
       const draft = this.selectedDraft
@@ -274,6 +359,7 @@ export const useScriptStore = defineStore('museum-script', {
         const restored = JSON.parse(JSON.stringify(version.draft)) as LanguageDraft
         if (index >= 0) exhibit.drafts[index] = restored
         else exhibit.drafts.push(restored)
+        this.tombstones = this.tombstones.filter(id => !restored.segments.some(segment => segment.id === id))
       })
       this.selectedExhibitId = version.exhibitId
       this.selectedLanguageId = version.languageId
@@ -298,6 +384,119 @@ export const useScriptStore = defineStore('museum-script', {
       this.ensureSelection()
       this.persist()
       this.notice = '已重做。'
+    },
+    exportSyncPackage(exportedBy: string, note: string): SyncPackage {
+      const current = createDataset(this.halls, this.exhibits, this.tombstones)
+      const pkg = createSyncPackage(current, this.syncBaseline, exportedBy, note)
+      this.notice = `巡展交接包 ${pkg.packageId} 已导出，包含共同基线。`
+      return pkg
+    },
+    importSyncPackageText(text: string) {
+      let pkg: SyncPackage
+      try {
+        pkg = parseSyncPackage(text)
+      } catch (error) {
+        this.notice = error instanceof Error ? `导入被拒绝：${error.message}` : '导入被拒绝：交接包无法读取。'
+        return
+      }
+
+      if (this.syncReceipts.some(receipt => receipt.packageId === pkg.packageId)) {
+        this.notice = `交接包 ${pkg.packageId} 已完成导入，重复导入只保留原回执。`
+        return
+      }
+      if (this.pendingSyncImport?.pkg.packageId === pkg.packageId) {
+        this.notice = '该交接包仍有未决冲突，请先选择冲突处理方式。'
+        return
+      }
+
+      const local = createDataset(this.halls, this.exhibits, this.tombstones)
+      const result = reconcileImport(local, pkg)
+      const conflictReceipt: SyncReceipt = {
+        packageId: pkg.packageId,
+        exportedAt: pkg.exportedAt,
+        importedAt: new Date().toISOString(),
+        exportedBy: pkg.exportedBy,
+        status: 'conflict',
+        accepted: result.stats.accepted,
+        conflicts: result.stats.conflicts,
+        localAdds: result.stats.localAdds,
+        remoteAdds: result.stats.remoteAdds,
+        localDeletes: result.stats.localDeletes,
+        remoteDeletes: result.stats.remoteDeletes,
+        revived: result.stats.revived,
+        suppressed: result.stats.suppressed
+      }
+
+      this.pendingSyncImport = { pkg, conflicts: result.conflicts }
+      const existingIndex = this.syncReceipts.findIndex(receipt => receipt.packageId === pkg.packageId)
+      if (existingIndex >= 0) this.syncReceipts[existingIndex] = conflictReceipt
+      else this.syncReceipts.unshift(conflictReceipt)
+      this.persist()
+      this.notice = result.stats.conflicts
+        ? `发现 ${result.stats.conflicts} 处未决冲突；已暂存，未写入任何单边改动。`
+        : '对账完成，正在写入单边改动。'
+      if (!result.stats.conflicts) this.applyPendingSyncImport()
+    },
+    resolveSyncConflict(conflictId: string, resolution: SyncConflictChoice) {
+      if (!this.pendingSyncImport) return
+      const conflict = this.pendingSyncImport.conflicts.find(item => item.id === conflictId)
+      if (conflict) conflict.resolution = resolution
+      this.persist()
+    },
+    clearSyncConflictResolution(conflictId: string) {
+      if (!this.pendingSyncImport) return
+      const conflict = this.pendingSyncImport.conflicts.find(item => item.id === conflictId)
+      if (conflict) delete conflict.resolution
+      this.persist()
+    },
+    cancelPendingSyncImport() {
+      if (!this.pendingSyncImport) return
+      const packageId = this.pendingSyncImport.pkg.packageId
+      this.pendingSyncImport = null
+      this.syncReceipts = this.syncReceipts.filter(receipt => receipt.packageId !== packageId || receipt.status === 'success')
+      this.persist()
+      this.notice = '未决冲突已撤回，导入前数据未被修改。'
+    },
+    applyPendingSyncImport() {
+      if (!this.pendingSyncImport) return
+      const pkg = this.pendingSyncImport
+      const before = JSON.stringify({
+        halls: this.halls,
+        exhibits: this.exhibits,
+        versions: this.versions,
+        syncBaseline: this.syncBaseline,
+        tombstones: this.tombstones,
+        pendingSyncImport: this.pendingSyncImport,
+        syncReceipts: this.syncReceipts
+      })
+
+      try {
+        const local = createDataset(this.halls, this.exhibits, this.tombstones)
+        const result = reconcileImport(local, pkg.pkg, pkg.conflicts)
+        const unresolved = result.conflicts.filter(conflict => !conflict.resolution).length
+        if (unresolved > 0) {
+          this.notice = `还有 ${unresolved} 处冲突未选择，暂不写入。`
+          return
+        }
+
+        const receipt = receiptFromResult(pkg.pkg, result)
+        this.halls = result.merged.halls
+        this.exhibits = result.merged.exhibits
+        this.tombstones = result.merged.tombstones
+        this.syncBaseline = clone(result.merged)
+        this.pendingSyncImport = null
+        const index = this.syncReceipts.findIndex(item => item.packageId === receipt.packageId)
+        if (index >= 0) this.syncReceipts[index] = receipt
+        else this.syncReceipts.unshift(receipt)
+        this.lastSavedAt = new Date().toISOString()
+        this.ensureSelection()
+        this.persist()
+        this.notice = `交接包导入完成：接收 ${receipt.accepted} 处单边改动，旧删除记录未被复活。`
+      } catch (error) {
+        this.$patch(JSON.parse(before))
+        this.persist()
+        this.notice = error instanceof Error ? `导入失败，已恢复导入前状态：${error.message}` : '导入失败，已恢复导入前状态。'
+      }
     },
     completionFor(exhibit: Exhibit, languageId: string): number {
       const draft = exhibit.drafts.find(item => item.languageId === languageId)

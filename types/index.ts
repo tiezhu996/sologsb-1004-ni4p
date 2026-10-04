@@ -1,5 +1,7 @@
 export type ScriptStatus = 'draft' | 'review' | 'returned' | 'approved'
 export type DeviceKind = 'desktop' | 'tablet' | 'mobile' | 'kiosk'
+export type SyncConflictChoice = 'local' | 'remote' | 'delete'
+export type SyncReceiptStatus = 'conflict' | 'success'
 
 export interface Hall {
   id: string
@@ -52,10 +54,82 @@ export interface VersionSnapshot {
   draft: LanguageDraft
 }
 
+export interface SyncDataset {
+  halls: Hall[]
+  exhibits: Exhibit[]
+  tombstones: string[]
+}
+
+export interface SyncPackage {
+  packageId: string
+  format: 'museum-script-sync/1'
+  exportedAt: string
+  exportedBy: string
+  note: string
+  base: SyncDataset
+  current: SyncDataset
+}
+
+export interface SyncStats {
+  accepted: number
+  conflicts: number
+  localAdds: number
+  remoteAdds: number
+  localDeletes: number
+  remoteDeletes: number
+  revived: number
+  suppressed: number
+}
+
+export interface SyncConflict {
+  id: string
+  packageId: string
+  entityType: 'hall' | 'exhibit' | 'draft' | 'segment'
+  entityId: string
+  parentId?: string
+  field: string
+  kind: 'field' | 'presence'
+  baseValue: unknown
+  localValue: unknown
+  remoteValue: unknown
+  resolution?: SyncConflictChoice
+}
+
+export interface SyncReconciliation {
+  merged: SyncDataset
+  conflicts: SyncConflict[]
+  stats: SyncStats
+}
+
+export interface PendingSyncImport {
+  pkg: SyncPackage
+  conflicts: SyncConflict[]
+}
+
+export interface SyncReceipt {
+  packageId: string
+  exportedAt: string
+  importedAt: string
+  exportedBy: string
+  status: SyncReceiptStatus
+  accepted: number
+  conflicts: number
+  localAdds: number
+  remoteAdds: number
+  localDeletes: number
+  remoteDeletes: number
+  revived: number
+  suppressed: number
+}
+
 export interface PersistedState {
   halls: Hall[]
   exhibits: Exhibit[]
   versions: VersionSnapshot[]
+  syncBaseline: SyncDataset
+  tombstones: string[]
+  pendingSyncImport: PendingSyncImport | null
+  syncReceipts: SyncReceipt[]
   selectedHallId: string
   selectedExhibitId: string
   selectedLanguageId: string

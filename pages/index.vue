@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment } from '~/types'
+import type { DeviceKind, DiffLine, LanguageDraft, ScriptStatus, Segment, SyncConflict, SyncConflictChoice } from '~/types'
 import { LANGUAGES, useScriptStore } from '~/stores/script'
+import { describeConflict } from '~/utils/sync'
 
 const store = useScriptStore()
 const activeTab = ref('editor')
@@ -12,6 +13,10 @@ const compareA = ref('')
 const compareB = ref('')
 const helpDialog = ref(false)
 const deleteTarget = ref<string | null>(null)
+const syncExporter = ref('巡展组')
+const syncNote = ref('')
+const syncFileName = ref('')
+const importInput = ref<HTMLInputElement | null>(null)
 
 const statusOptions: Array<{ value: ScriptStatus; label: string; color: string }> = [
   { value: 'draft', label: '草稿', color: 'grey' },
@@ -105,6 +110,50 @@ function buildDiff(before: string, after: string): DiffLine[] {
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
+const pendingImport = computed(() => store.pendingSyncImport)
+const pendingConflicts = computed(() => pendingImport.value?.conflicts || [])
+const unresolvedConflicts = computed(() => pendingConflicts.value.filter(item => !item.resolution))
+const syncReceipts = computed(() => store.syncReceipts)
+
+function downloadSyncPackage() {
+  const pkg = store.exportSyncPackage(syncExporter.value, syncNote.value)
+  const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `museum-sync-${new Date(pkg.exportedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`
+  link.click()
+  URL.revokeObjectURL(url)
+}
+function triggerImportPicker() {
+  importInput.value?.click()
+}
+function handleImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  syncFileName.value = file.name
+  const reader = new FileReader()
+  reader.onload = () => store.importSyncPackageText(String(reader.result || ''))
+  reader.onerror = () => { store.notice = '交接包读取失败，请重试。' }
+  reader.readAsText(file)
+  input.value = ''
+}
+function chooseConflict(conflict: SyncConflict, resolution: SyncConflictChoice) {
+  store.resolveSyncConflict(conflict.id, resolution)
+}
+function conflictValue(value: unknown) {
+  if (value === null || value === undefined || value === '') return '（空）'
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (typeof value === 'object') return JSON.stringify(value, null, 2)
+  return String(value)
+}
+function conflictChoiceLabel(conflict: SyncConflict) {
+  if (conflict.resolution === 'local') return conflict.kind === 'presence' ? '保留本馆记录' : '使用本馆值'
+  if (conflict.resolution === 'remote') return conflict.kind === 'presence' ? '使用巡展记录' : '使用巡展值'
+  if (conflict.resolution === 'delete') return '删除记录'
+  return '待选择'
+}
 function segmentLabel(segment: Segment) { return segment.label || '未命名段落' }
 </script>
 
@@ -195,6 +244,7 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
 
         <v-tabs v-model="activeTab" color="primary" bg-color="surface" rounded="lg" class="mb-4 px-2">
           <v-tab value="editor">脚本编辑</v-tab>
+          <v-tab value="sync">巡展交接</v-tab>
           <v-tab value="versions">版本比较</v-tab>
           <v-tab value="preview">设备预览</v-tab>
           <v-tab value="sources">资料核对</v-tab>
@@ -293,6 +343,107 @@ function segmentLabel(segment: Segment) { return segment.label || '未命名段�
                     <v-alert class="mt-3" type="info" variant="tonal" density="compact">
                       估算语速约 {{ Math.max(1, Math.round(draft.narration.length / 220 * 10) / 10) }} 分钟，请与目标时长核对。
                     </v-alert>
+                  </v-card>
+                </v-col>
+              </v-row>
+            </v-window-item>
+
+            <v-window-item value="sync">
+              <v-row>
+                <v-col cols="12" md="6">
+                  <v-card class="script-card pa-5">
+                    <div class="section-title mb-2">导出巡展交接包</div>
+                    <p class="text-body-2 text-medium-emphasis mb-4">
+                      包内同时写入展厅、展项、每种语言稿及段落的“共同基线”和巡展当前稿。回馆导入时逐字段对账，不会整库覆盖。
+                    </p>
+                    <v-text-field v-model="syncExporter" label="导出人 / 巡展组" hide-details class="mb-3" />
+                    <v-textarea v-model="syncNote" label="交接备注（可选）" rows="3" auto-grow class="mb-4" />
+                    <v-btn color="primary" prepend-icon="mdi-package-variant-closed" block @click="downloadSyncPackage">下载交接包</v-btn>
+                  </v-card>
+                </v-col>
+                <v-col cols="12" md="6">
+                  <v-card class="script-card pa-5">
+                    <div class="section-title mb-2">导入巡展交接包</div>
+                    <p class="text-body-2 text-medium-emphasis mb-4">
+                      只有一边改过的字段自动接收；同一字段两边都改过会列为冲突，逐项选定后才写入。同一个包重复导入只保留一张回执。
+                    </p>
+                    <input ref="importInput" type="file" accept="application/json,.json" class="d-none" @change="handleImportFile" />
+                    <v-btn variant="outlined" prepend-icon="mdi-upload-outline" block class="mb-3" @click="triggerImportPicker">选择交接包</v-btn>
+                    <div v-if="syncFileName" class="text-caption text-medium-emphasis">最近选择：{{ syncFileName }}</div>
+                  </v-card>
+                </v-col>
+
+                <v-col v-if="pendingImport" cols="12">
+                  <v-card class="script-card pa-5 border-2" style="border-color:#b26b00">
+                    <div class="d-flex flex-wrap align-center justify-space-between ga-3 mb-4">
+                      <div>
+                        <div class="section-title">未决冲突</div>
+                        <div class="text-body-2 text-medium-emphasis mt-1">
+                          {{ pendingImport.pkg.packageId }} · {{ pendingImport.pkg.exportedBy }} · 尚有 {{ unresolvedConflicts.length }} 处待选择
+                        </div>
+                      </div>
+                      <div class="d-flex ga-2">
+                        <v-btn variant="text" color="error" @click="store.cancelPendingSyncImport()">撤回此包</v-btn>
+                        <v-btn color="primary" prepend-icon="mdi-check-decagram" :disabled="unresolvedConflicts.length > 0" @click="store.applyPendingSyncImport()">确认写入</v-btn>
+                      </div>
+                    </div>
+                    <v-alert type="warning" variant="tonal" class="mb-4">冲突解决前不会修改当前库；撤回后保留导入前状态。</v-alert>
+                    <div v-for="conflict in pendingConflicts" :key="conflict.id" class="conflict-card pa-4 mb-3 rounded-lg border">
+                      <div class="d-flex flex-wrap justify-space-between ga-3 mb-3">
+                        <div>
+                          <div class="font-weight-medium">{{ describeConflict(conflict) }}</div>
+                          <div class="text-caption text-medium-emphasis mt-1">{{ conflictChoiceLabel(conflict) }}</div>
+                        </div>
+                        <v-chip size="small" :color="conflict.resolution ? 'success' : 'warning'" variant="tonal">
+                          {{ conflict.resolution ? '已选择' : '待选择' }}
+                        </v-chip>
+                      </div>
+                      <v-row dense>
+                        <v-col cols="12" md="4">
+                          <div class="text-caption text-medium-emphasis mb-1">共同基线</div>
+                          <pre class="conflict-value">{{ conflictValue(conflict.baseValue) }}</pre>
+                        </v-col>
+                        <v-col cols="12" md="4">
+                          <div class="text-caption text-medium-emphasis mb-1">本馆当前</div>
+                          <pre class="conflict-value">{{ conflictValue(conflict.localValue) }}</pre>
+                        </v-col>
+                        <v-col cols="12" md="4">
+                          <div class="text-caption text-medium-emphasis mb-1">巡展稿</div>
+                          <pre class="conflict-value">{{ conflictValue(conflict.remoteValue) }}</pre>
+                        </v-col>
+                      </v-row>
+                      <div class="d-flex flex-wrap ga-2 mt-3">
+                        <v-btn size="small" :variant="conflict.resolution === 'local' ? 'flat' : 'outlined'" color="primary" @click="chooseConflict(conflict, 'local')">
+                          {{ conflict.kind === 'presence' ? '保留本馆' : '用本馆值' }}
+                        </v-btn>
+                        <v-btn size="small" :variant="conflict.resolution === 'remote' ? 'flat' : 'outlined'" color="secondary" @click="chooseConflict(conflict, 'remote')">
+                          {{ conflict.kind === 'presence' ? '采用巡展' : '用巡展值' }}
+                        </v-btn>
+                        <v-btn v-if="conflict.kind === 'presence'" size="small" :variant="conflict.resolution === 'delete' ? 'flat' : 'outlined'" color="error" @click="chooseConflict(conflict, 'delete')">删除</v-btn>
+                      </div>
+                    </div>
+                  </v-card>
+                </v-col>
+
+                <v-col cols="12">
+                  <v-card class="script-card pa-5">
+                    <div class="d-flex align-center justify-space-between mb-4">
+                      <div class="section-title">导入回执</div>
+                      <v-chip variant="tonal">{{ syncReceipts.length }} 张</v-chip>
+                    </div>
+                    <v-empty-state v-if="!syncReceipts.length" icon="mdi-receipt-text-outline" title="暂无导入回执" text="导入成功或发现冲突后会在此显示。" />
+                    <v-list v-else lines="two" class="bg-transparent">
+                      <v-list-item v-for="receipt in syncReceipts" :key="receipt.packageId" :title="`${receipt.packageId} · ${receipt.exportedBy}`" :subtitle="`${formatTime(receipt.importedAt)} 导入 · ${receipt.status === 'success' ? '已写入' : '有未决冲突'}`">
+                        <template #prepend>
+                          <v-icon :color="receipt.status === 'success' ? 'success' : 'warning'">{{ receipt.status === 'success' ? 'mdi-check-circle-outline' : 'mdi-alert-outline' }}</v-icon>
+                        </template>
+                        <template #append>
+                          <v-chip size="small" variant="tonal" class="me-2">接收 {{ receipt.accepted }}</v-chip>
+                          <v-chip size="small" variant="tonal" color="warning" class="me-2">冲突 {{ receipt.conflicts }}</v-chip>
+                          <v-chip size="small" variant="tonal" color="error">拦截复活 {{ receipt.suppressed }}</v-chip>
+                        </template>
+                      </v-list-item>
+                    </v-list>
                   </v-card>
                 </v-col>
               </v-row>
